@@ -2,6 +2,7 @@ import asyncio
 import html
 import logging
 import os
+import time
 from contextlib import suppress
 from urllib.parse import quote
 
@@ -39,6 +40,8 @@ ALLOW_WITHOUT_SPONSORS = os.getenv("ALLOW_WITHOUT_SPONSORS", "1") == "1"
 
 PIARFLOW_API_URL = "https://piarflow.com/v1"
 DONE_STATUSES = {"subscribed", "not_counted"}
+# не дёргать PiarFlow чаще, чем раз в N секунд на одного пользователя (защита от 429 при быстрых кликах)
+CHECK_TTL = float(os.getenv("CHECK_TTL", "3"))
 
 bot = Bot(
     BOT_TOKEN,
@@ -47,6 +50,7 @@ bot = Bot(
 router = Router()
 http: aiohttp.ClientSession | None = None
 pending_links: dict[int, list[str]] = {}
+last_ok: dict[int, float] = {}  # когда пользователь последний раз прошёл проверку заданий
 
 
 # ───────────────────────── Утилиты ─────────────────────────
@@ -272,18 +276,35 @@ async def piarflow(path: str, payload: dict) -> dict:
         return data
 
 
-async def open_gate(target: Message | CallbackQuery, user) -> None:
-    """Показывает задания PiarFlow. Если всё выполнено / заданий нет — открывает доступ."""
-    chat_id = target.message.chat.id if isinstance(target, CallbackQuery) else target.chat.id
-    retry = kb([cb_btn("🔄 Повторить", "gate:check")])
-    try:
-        data = await piarflow("/sponsors", {"user_id": user.id, "chat_id": chat_id, "max_sponsors": MAX_SPONSORS})
-    except Exception:
-        log.exception("PiarFlow /sponsors failed")
-        await show(target, "⚠️ <b>Сервис заданий временно недоступен</b>\n\nПопробуй ещё раз через минуту.", retry)
-        return
+def chat_id_of(target: Message | CallbackQuery) -> int:
+    return target.message.chat.id if isinstance(target, CallbackQuery) else target.chat.id
 
-    sponsors = data.get("sponsors") or []
+
+async def fetch_sponsors(user_id: int, chat_id: int) -> list[dict]:
+    data = await piarflow("/sponsors", {"user_id": user_id, "chat_id": chat_id, "max_sponsors": MAX_SPONSORS})
+    return data.get("sponsors") or []
+
+
+def not_done(sponsors: list[dict]) -> list[dict]:
+    return [s for s in sponsors if s.get("status") not in DONE_STATUSES]
+
+
+async def open_gate(target: Message | CallbackQuery, user, sponsors: list[dict] | None = None, new: bool = False) -> None:
+    """Показывает задания PiarFlow. Если всё выполнено / заданий нет — открывает доступ."""
+    retry = kb([cb_btn("🔄 Повторить", "gate:check")])
+    if sponsors is None:
+        try:
+            sponsors = await fetch_sponsors(user.id, chat_id_of(target))
+        except Exception as e:
+            log.exception("PiarFlow /sponsors failed")
+            extra = f"\n\n<code>{html.escape(str(e))[:300]}</code>" if user.id in ADMIN_IDS else ""
+            await show(
+                target,
+                "⚠️ <b>Сервис заданий временно недоступен</b>\n\nПопробуй ещё раз через минуту." + extra,
+                retry,
+            )
+            return
+
     todo = [s for s in sponsors if s.get("status") not in DONE_STATUSES]
     if not todo:
         if sponsors or ALLOW_WITHOUT_SPONSORS:
@@ -296,8 +317,9 @@ async def open_gate(target: Message | CallbackQuery, user) -> None:
     pending_links[user.id] = [s["link"] for s in todo]
     rows = [[InlineKeyboardButton(text=f"📢 Задание {i}", url=s["link"])] for i, s in enumerate(todo, 1)]
     rows.append([cb_btn("✅ Проверить подписки", "gate:check")])
+    title = "🆕 <b>Появились новые задания</b>" if new else "🔐 <b>Открой доступ к боту</b>"
     text = (
-        f"🔐 <b>Открой доступ к боту</b>\n{LINE}\n\n"
+        f"{title}\n{LINE}\n\n"
         "Подпишись на каналы ниже — это бесплатно и займёт минуту.\n"
         "Затем нажми <b>«Проверить подписки»</b>.\n\n"
         "✨ <i>Приглашённые тобой друзья засчитываются только после подписки на каналы.</i>"
@@ -306,6 +328,7 @@ async def open_gate(target: Message | CallbackQuery, user) -> None:
 
 
 async def grant_access(target: Message | CallbackQuery, user) -> None:
+    last_ok[user.id] = time.monotonic()
     payouts = await db.verify(user.id)
     for referrer_id, level, amount in payouts:
         text = (
@@ -659,6 +682,20 @@ class AccessMiddleware(BaseMiddleware):
             await db.register(user, None)
             row = await db.get_user(user.id)
         if row["verified"]:
+            # проверяем КАЖДОЕ действие: вдруг появились новые задания
+            if time.monotonic() - last_ok.get(user.id, 0) < CHECK_TTL:
+                return await handler(event, data)
+            try:
+                sponsors = await fetch_sponsors(user.id, chat_id_of(event))
+            except Exception:
+                log.exception("PiarFlow recheck failed")  # сервис лёг — не блокируем уже подтверждённых
+                return await handler(event, data)
+            if not_done(sponsors):
+                if isinstance(event, CallbackQuery):
+                    await event.answer()
+                await open_gate(event, user, sponsors, new=True)
+                return
+            last_ok[user.id] = time.monotonic()
             return await handler(event, data)
 
         if isinstance(event, CallbackQuery):
